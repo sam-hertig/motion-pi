@@ -1,0 +1,7 @@
+tunnel: motion-tunnel
+credentials-file: /etc/cloudflared/EXAMPLE-ID.json
+
+ingress:
+ - hostname: motion.example.com
+   service: http://localhost:8080
+ - service: http_status:404

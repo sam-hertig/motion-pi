@@ -1,69 +1,119 @@
 from gpiozero import MotionSensor
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import time
 
-# GPIO pin for PIR
 PIR_PIN = 17
 
 pir = MotionSensor(PIR_PIN)
 app = Flask(__name__)
 
-last_motion = None  # will store datetime of last motion
+motion_events = []
+last_motion = None
+
+
+def floor_to_quarter(dt: datetime) -> datetime:
+    minute_block = (dt.minute // 15) * 15
+    return dt.replace(minute=minute_block, second=0, microsecond=0)
 
 
 def motion_watcher():
-    global last_motion
-    print("PIR watcher started, waiting for motion...")
-    # give sensor time to stabilise
+    global last_motion, motion_events
+    print("PIR watcher started...")
     time.sleep(2)
+
     while True:
         pir.wait_for_motion()
-        last_motion = datetime.now()
-        print("Motion detected at", last_motion.strftime("%Y-%m-%d %H:%M:%S"))
-        # wait until no motion to avoid spamming
+        now = datetime.now()
+        last_motion = now
+        motion_events.append(now)
+
+        cutoff = now - timedelta(hours=48)
+        motion_events[:] = [t for t in motion_events if t >= cutoff]
+
         pir.wait_for_no_motion()
-        print("No motion")
+
+
+def build_15min_bins_html():
+    now = datetime.now()
+    lookback_start = now - timedelta(hours=24)
+    recent_events = [t for t in motion_events if t >= lookback_start]
+
+    bin_length = timedelta(minutes=15)
+    current_bin_start = floor_to_quarter(now)
+
+    if recent_events:
+        earliest_event = min(recent_events)
+        earliest_bin = floor_to_quarter(earliest_event)
+        start_bin = max(earliest_bin, floor_to_quarter(lookback_start))
+    else:
+        start_bin = current_bin_start
+
+    lines = []
+    bin_start = start_bin
+
+    while bin_start <= current_bin_start:
+        bin_end = bin_start + bin_length
+        display_end = min(bin_end, now)
+
+        count = sum(1 for t in recent_events if bin_start <= t < bin_end)
+
+        date_str = bin_start.strftime("%Y-%m-%d")
+        start_str = bin_start.strftime("%H:%M")
+        end_str = display_end.strftime("%H:%M")
+
+        lines.append(f"{date_str} {start_str} - {end_str}: Detected {count:2d} motion events.")
+
+        if bin_start.minute == 45 and bin_start < current_bin_start:
+            lines.append("")
+
+        bin_start += bin_length
+
+    return "<br>".join(lines)
 
 
 @app.route("/")
 def index():
-    if last_motion is None:
-        msg = "No motion detected yet."
-    else:
-        msg = last_motion.strftime("%Y-%m-%d %H:%M:%S")
-    # very simple HTML with auto-refresh
+    bins_html = build_15min_bins_html()
+
     return f"""
     <html>
       <head>
-        <title>Motion Sensor</title>
-        <meta http-equiv="refresh" content="5">
+        <title>Motion Activity</title>
+        <meta http-equiv="refresh" content="30">
         <style>
           body {{
             font-family: sans-serif;
             margin: 2rem;
+            line-height: 1.4;
           }}
-          .card {{
+          h1 {{
+            margin-bottom: 0.3rem;
+          }}
+          .subtitle {{
+            color: #555;
+            margin-bottom: 1rem;
+          }}
+          .box {{
             border: 1px solid #ccc;
             border-radius: 8px;
-            padding: 1.5rem;
-            max-width: 400px;
-          }}
-          .label {{
-            color: #555;
-            margin-bottom: 0.5rem;
-          }}
-          .time {{
-            font-size: 1.5rem;
-            font-weight: bold;
+            padding: 1rem 1.5rem;
+            max-width: 650px;
+            background: #fafafa;
+            text-align: left;
+            font-family: monospace;
+            white-space: pre;
           }}
         </style>
       </head>
       <body>
-        <div class="card">
-          <div class="label">Last motion detected:</div>
-          <div class="time">{msg}</div>
+        <h1>Motion Activity</h1>
+        <div class="subtitle">
+          15-minute bins, up to the last 24 hours. Page refreshes every 30 seconds.
+        </div>
+        <div class="box">
+          {bins_html}
         </div>
       </body>
     </html>
@@ -71,9 +121,6 @@ def index():
 
 
 if __name__ == "__main__":
-    # run motion watcher in background thread
     t = threading.Thread(target=motion_watcher, daemon=True)
     t.start()
-
-    # run web server on port 8080, accessible from anywhere via cloudflared
     app.run(host="0.0.0.0", port=8080)

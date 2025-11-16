@@ -1,0 +1,69 @@
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+.dist/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.python-version
+
+# -----------------------------
+# Logs / runtime files
+# -----------------------------
+*.log
+*.tmp
+*.pid
+*.sqlite
+*.db
+
+# -----------------------------
+# Cloudflare Tunnel (VERY IMPORTANT)
+# -----------------------------
+# Never commit your real tunnel credentials!
+cloudflared/
+cloudflare/
+*.json
+/etc/cloudflared/*
+!cloudflared-config.yml
+!cloudflared-config.yml.example
+
+# -----------------------------
+# Systemd service files
+# -----------------------------
+*.service
+!/systemd/
+!/systemd/*.service.example
+
+# -----------------------------
+# OS junk
+# -----------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# -----------------------------
+# Editor / IDE junk
+# -----------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+
+# -----------------------------
+# Local backups
+# -----------------------------
+*~
+*.old
+*.backup
