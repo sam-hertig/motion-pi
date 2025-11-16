@@ -100,6 +100,12 @@ sudo systemctl status motion
 sudo systemctl status cloudflared
 ```
 
+## Restarting the motion service after updating the script
+
+1. Update `motion_web.py` on the Raspberry
+2. Run `sudo systemctl restart motion` in the terminal on the Raspberry
+
+
 ## Troubleshooting
 
 Check logs:
