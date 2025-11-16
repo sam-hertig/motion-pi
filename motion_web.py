@@ -32,7 +32,10 @@ def motion_watcher():
         cutoff = now - timedelta(hours=48)
         motion_events[:] = [t for t in motion_events if t >= cutoff]
 
+        print("Motion detected at", now.strftime("%Y-%m-%d %H:%M:%S"))
+
         pir.wait_for_no_motion()
+        print("No motion")
 
 
 def build_15min_bins_html():
@@ -50,7 +53,7 @@ def build_15min_bins_html():
     else:
         start_bin = current_bin_start
 
-    lines = []
+    html_parts = []
     bin_start = start_bin
 
     while bin_start <= current_bin_start:
@@ -63,14 +66,16 @@ def build_15min_bins_html():
         start_str = bin_start.strftime("%H:%M")
         end_str = display_end.strftime("%H:%M")
 
-        lines.append(f"{date_str} {start_str} - {end_str}: Detected {count:2d} motion events.")
+        line = f"{date_str} {start_str} - {end_str}: Detected {count:2d} motion events."
+        html_parts.append(f"<div class='row'>{line}</div>")
 
+        # Optional visual separator after each full hour (after :45 bin)
         if bin_start.minute == 45 and bin_start < current_bin_start:
-            lines.append("")
+            html_parts.append("<hr class='hour-sep'>")
 
         bin_start += bin_length
 
-    return "<br>".join(lines)
+    return "".join(html_parts)
 
 
 @app.route("/")
@@ -103,7 +108,15 @@ def index():
             background: #fafafa;
             text-align: left;
             font-family: monospace;
+          }}
+          .row {{
+            margin: 2px 0;
             white-space: pre;
+          }}
+          .hour-sep {{
+            border: none;
+            border-top: 1px solid #ccc;
+            margin: 6px 0;
           }}
         </style>
       </head>
