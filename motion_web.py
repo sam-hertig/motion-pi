@@ -4,6 +4,12 @@ from datetime import datetime, timedelta
 import threading
 import time
 
+# ============================================================
+# CONFIGURATION: CHANGE BIN SIZE HERE
+# ============================================================
+BIN_MINUTES = 5   # <-- change this to 5, 10, 30, 60, etc.
+# ============================================================
+
 PIR_PIN = 17
 
 pir = MotionSensor(PIR_PIN)
@@ -11,10 +17,12 @@ app = Flask(__name__)
 
 motion_events = []
 last_motion = None
+start_time = datetime.now()   # first visible bin starts here
 
 
-def floor_to_quarter(dt: datetime) -> datetime:
-    minute_block = (dt.minute // 15) * 15
+def floor_to_bin(dt: datetime) -> datetime:
+    """Floor a datetime to the previous BIN_MINUTES boundary."""
+    minute_block = (dt.minute // BIN_MINUTES) * BIN_MINUTES
     return dt.replace(minute=minute_block, second=0, microsecond=0)
 
 
@@ -29,6 +37,7 @@ def motion_watcher():
         last_motion = now
         motion_events.append(now)
 
+        # prune older than ~48h
         cutoff = now - timedelta(hours=48)
         motion_events[:] = [t for t in motion_events if t >= cutoff]
 
@@ -38,25 +47,27 @@ def motion_watcher():
         print("No motion")
 
 
-def build_15min_bins_html():
+def build_bins_html():
+    """Build HTML listing motion counts in BIN_MINUTES bins."""
     now = datetime.now()
-    lookback_start = now - timedelta(hours=24)
-    recent_events = [t for t in motion_events if t >= lookback_start]
 
-    bin_length = timedelta(minutes=15)
-    current_bin_start = floor_to_quarter(now)
+    # Only show from service start time or last 24h
+    visible_start = max(start_time, now - timedelta(hours=24))
 
-    if recent_events:
-        earliest_event = min(recent_events)
-        earliest_bin = floor_to_quarter(earliest_event)
-        start_bin = max(earliest_bin, floor_to_quarter(lookback_start))
-    else:
-        start_bin = current_bin_start
+    recent_events = [t for t in motion_events if t >= visible_start]
+
+    bin_length = timedelta(minutes=BIN_MINUTES)
+    current_bin_start = floor_to_bin(now)
+    start_bin = floor_to_bin(visible_start)
 
     html_parts = []
     bin_start = start_bin
 
-    while bin_start <= current_bin_start:
+    # We never exceed 24h worth of bins
+    max_bins = int(24 * 60 / BIN_MINUTES)
+
+    count_bins = 0
+    while bin_start <= current_bin_start and count_bins < max_bins:
         bin_end = bin_start + bin_length
         display_end = min(bin_end, now)
 
@@ -69,18 +80,19 @@ def build_15min_bins_html():
         line = f"{date_str} {start_str} - {end_str}: Detected {count:2d} motion events."
         html_parts.append(f"<div class='row'>{line}</div>")
 
-        # Optional visual separator after each full hour (after :45 bin)
-        if bin_start.minute == 45 and bin_start < current_bin_start:
+        # Separator rule at the end of each hour
+        if (bin_start.minute + BIN_MINUTES) % 60 == 0 and bin_start < current_bin_start:
             html_parts.append("<hr class='hour-sep'>")
 
         bin_start += bin_length
+        count_bins += 1
 
     return "".join(html_parts)
 
 
 @app.route("/")
 def index():
-    bins_html = build_15min_bins_html()
+    bins_html = build_bins_html()
 
     return f"""
     <html>
@@ -123,7 +135,8 @@ def index():
       <body>
         <h1>Motion Activity</h1>
         <div class="subtitle">
-          15-minute bins, up to the last 24 hours. Page refreshes every 30 seconds.
+          Activity in {BIN_MINUTES}-minute bins since service start (max last 24h).
+          Page refreshes every 30 seconds.
         </div>
         <div class="box">
           {bins_html}
