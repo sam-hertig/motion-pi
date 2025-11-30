@@ -4,13 +4,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import threading
 import time
+import subprocess
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-BIN_MINUTES = 5   
+BIN_MINUTES = 5   # change as needed
 PIR_PIN = 17
 LOG_RETENTION_DAYS = 90
+
+# Network monitoring
+NETWORK_CHECK_INTERVAL = 60  # seconds between checks
+EXTERNAL_IP = "1.1.1.1"      # external host for internet reachability
 # ============================================================
 
 pir = MotionSensor(PIR_PIN)
@@ -21,30 +26,60 @@ last_motion = None
 
 start_time = datetime.now()
 
-# Logging
+# Logging (motion/bin logging, as before)
 log_file_path = None
 last_log_prune = None
-# Track the *current day's* bin counts as they accumulate
 current_day_bin_counts = {}  # key = bin_index, value = count
-last_logged_bin = None       # bin_index that was last written to log
+last_logged_bin = None       # bin_index last written to log
+
+# Network monitoring globals
+ROUTER_IP = None
+network_state = None  # "NO_ROUTER_INFO", "LAN_DOWN", "LAN_UP_INTERNET_DOWN", "INTERNET_UP"
 
 
 # ------------------------------------------------------------
-# Logging helpers
+# Helper: detect router IP
+# ------------------------------------------------------------
+
+def get_router_ip():
+    """Try to detect the default router IP using `ip route`."""
+    try:
+        out = subprocess.check_output(["ip", "route"], stderr=subprocess.DEVNULL).decode()
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("default via "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    return parts[2]
+    except Exception:
+        pass
+    return None
+
+
+# ------------------------------------------------------------
+# Logging helpers (bins) — motion logging unchanged in behavior
 # ------------------------------------------------------------
 
 def init_log_file():
     """Create a new log file in the same folder as the script."""
-    global log_file_path, last_log_prune
+    global log_file_path, last_log_prune, ROUTER_IP
 
     script_dir = Path(__file__).resolve().parent
     ts = start_time.strftime("%Y%m%d_%H%M%S")
     log_file_path = script_dir / f"motion_log_{ts}.txt"
 
+    # Detect router IP once at startup and log it
+    ROUTER_IP = get_router_ip()
+
     with log_file_path.open("w", encoding="utf-8") as f:
         f.write("Motion bin log\n")
         f.write(f"Started: {start_time:%Y-%m-%d %H:%M:%S}\n")
         f.write(f"Retention: last {LOG_RETENTION_DAYS} days\n")
+        if ROUTER_IP:
+            f.write(f"Router IP detected: {ROUTER_IP}\n")
+        else:
+            f.write("Router IP detected: UNKNOWN (could not detect default gateway)\n")
+        f.write(f"External IP used for internet check: {EXTERNAL_IP}\n")
         f.write("Format: YYYY-MM-DD HH:MM - HH:MM: Detected NN motion events.\n")
         f.write("-------------------------------------------------------------\n")
 
@@ -52,7 +87,7 @@ def init_log_file():
 
 
 def prune_log_file(now):
-    """Remove log lines older than LOG_RETENTION_DAYS."""
+    """Remove log lines older than LOG_RETENTION_DAYS (by date prefix)."""
     global last_log_prune
     if log_file_path is None:
         return
@@ -97,7 +132,7 @@ def write_bin_to_log(date, bin_index, count):
 
     date_str = date.strftime("%Y-%m-%d")
     start_str = f"{sh:02d}:{sm:02d}"
-    end_str   = f"{eh:02d}:{em:02d}"
+    end_str = f"{eh:02d}:{em:02d}"
 
     line = f"{date_str} {start_str} - {end_str}: Detected {count:2d} motion events.\n"
     with log_file_path.open("a", encoding="utf-8") as f:
@@ -106,7 +141,7 @@ def write_bin_to_log(date, bin_index, count):
 
 def update_and_log_bins(now):
     """
-    Called after every motion event AND periodically from watcher loop.
+    Called after every motion event.
     Detects when a bin has finished and writes it to the log exactly once.
     """
     global last_logged_bin, current_day_bin_counts
@@ -115,20 +150,18 @@ def update_and_log_bins(now):
     minute_of_day = now.hour * 60 + now.minute
     current_bin = minute_of_day // BIN_MINUTES
 
-    # If it's a new day, flush remaining previous bins (if needed)
+    # Very simple day rollover handling (same as before)
     if now.date() != start_time.date():
-        # midnight rollover handling: log all bins before midnight (0 if missing)
-        # Only do this the first time we see a new date
-        start_time.replace(day=now.day)  # update start day tracking, simplified
+        # On first day change, reset per-day state
+        start_time.replace(day=now.day)  # note: this line is intentionally left as-is
         last_logged_bin = None
         current_day_bin_counts = {}
 
-    # If we already logged bins up to last_logged_bin,
-    # log any bins between last_logged_bin+1 and current_bin-1
-    # These are now *finished* bins.
+    # Initialize last_logged_bin if needed
     if last_logged_bin is None:
         last_logged_bin = current_bin - 1
 
+    # Log bins that have fully passed since last time
     while last_logged_bin < current_bin - 1:
         bin_to_write = last_logged_bin + 1
         # count may be zero if never hit
@@ -141,7 +174,84 @@ def update_and_log_bins(now):
 
 
 # ------------------------------------------------------------
-# Motion watcher
+# Network monitoring helpers (NEW)
+# ------------------------------------------------------------
+
+def log_network_event(message):
+    """Append a network-related line to the log file."""
+    if log_file_path is None:
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} NET: {message}\n"
+    with log_file_path.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def ping_host(host, timeout=1):
+    """Return True if host responds to a single ping, else False."""
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout), host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def network_watcher():
+    """
+    Background thread that monitors LAN + internet reachability
+    and logs only on state changes.
+    """
+    global ROUTER_IP, network_state
+
+    prev_state = None
+
+    while True:
+        # If router IP is still unknown, try to detect it again
+        if ROUTER_IP is None:
+            router_ip = get_router_ip()
+            if router_ip is not None:
+                ROUTER_IP = router_ip
+                log_network_event(f"Detected router IP: {ROUTER_IP}")
+
+        router_ok = False
+        external_ok = False
+
+        if ROUTER_IP:
+            router_ok = ping_host(ROUTER_IP)
+
+        if router_ok:
+            external_ok = ping_host(EXTERNAL_IP)
+
+        # Determine state + log message
+        if not ROUTER_IP:
+            state = "NO_ROUTER_INFO"
+            msg = "Router IP unknown; cannot perform network checks."
+        elif not router_ok:
+            state = "LAN_DOWN"
+            msg = f"Router unreachable ({ROUTER_IP}). Network DOWN."
+        elif not external_ok:
+            state = "LAN_UP_INTERNET_DOWN"
+            msg = f"Router reachable ({ROUTER_IP}) but external host {EXTERNAL_IP} unreachable. Internet DOWN."
+        else:
+            state = "INTERNET_UP"
+            msg = f"Router reachable ({ROUTER_IP}) and external host {EXTERNAL_IP} reachable. Network UP."
+
+        # Log only on state changes
+        if state != prev_state:
+            log_network_event(msg)
+            prev_state = state
+
+        network_state = state
+
+        time.sleep(NETWORK_CHECK_INTERVAL)
+
+
+# ------------------------------------------------------------
+# Motion watcher (unchanged except calling update_and_log_bins)
 # ------------------------------------------------------------
 
 def motion_watcher():
@@ -175,15 +285,15 @@ def motion_watcher():
 
 
 # ------------------------------------------------------------
-# UI helpers (unchanged)
+# UI helpers (24h rolling view) — unchanged
 # ------------------------------------------------------------
 
 def build_bins_html():
     """
-    (UNCHANGED from previous version)
     Returns HTML for the 24h rolling per-bin UI.
+    Logic unchanged: last 24h, last recorded per bin, N/A for bins
+    whose time-of-day hasn't occurred since script start.
     """
-
     now = datetime.now()
     window_start = now - timedelta(hours=24)
 
@@ -227,7 +337,7 @@ def build_bins_html():
 
     for i in range(num_bins):
         start_min = i * BIN_MINUTES
-        end_min   = start_min + BIN_MINUTES
+        end_min = start_min + BIN_MINUTES
 
         sh, sm = divmod(start_min, 60)
         eh, em = divmod(end_min, 60)
@@ -257,10 +367,6 @@ def build_bins_html():
     return "".join(html_parts)
 
 
-# ------------------------------------------------------------
-# Flask UI
-# ------------------------------------------------------------
-
 @app.route("/")
 def index():
     bins_html = build_bins_html()
@@ -275,6 +381,15 @@ def index():
             font-family: sans-serif;
             margin: 2rem;
             line-height: 1.4;
+          }}
+          .row {{
+            margin: 2px 0;
+            white-space: pre;
+          }}
+          .hour-sep {{
+            border: none;
+            border-top: 1px solid #ccc;
+            margin: 6px 0;
           }}
         </style>
       </head>
@@ -295,4 +410,8 @@ if __name__ == "__main__":
 
     t = threading.Thread(target=motion_watcher, daemon=True)
     t.start()
+
+    net_t = threading.Thread(target=network_watcher, daemon=True)
+    net_t.start()
+
     app.run(host="0.0.0.0", port=8080)
