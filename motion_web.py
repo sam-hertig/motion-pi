@@ -17,13 +17,10 @@ app = Flask(__name__)
 
 motion_events = []
 last_motion = None
-start_time = datetime.now()   # first visible bin starts here
 
-
-def floor_to_bin(dt: datetime) -> datetime:
-    """Floor a datetime to the previous BIN_MINUTES boundary."""
-    minute_block = (dt.minute // BIN_MINUTES) * BIN_MINUTES
-    return dt.replace(minute=minute_block, second=0, microsecond=0)
+# Remember when the script started, so we know which bins
+# have ever had the chance to register events.
+start_time = datetime.now()
 
 
 def motion_watcher():
@@ -37,7 +34,7 @@ def motion_watcher():
         last_motion = now
         motion_events.append(now)
 
-        # prune older than ~48h
+        # Keep a bounded history: 48h is enough to compute "last 24h"
         cutoff = now - timedelta(hours=48)
         motion_events[:] = [t for t in motion_events if t >= cutoff]
 
@@ -48,44 +45,135 @@ def motion_watcher():
 
 
 def build_bins_html():
-    """Build HTML listing motion counts in BIN_MINUTES bins."""
+    """
+    Build HTML listing motion counts in BIN_MINUTES bins.
+
+    - Always shows 24h worth of bins aligned to time-of-day, e.g. for 5-minute bins:
+      00:00–00:05, 00:05–00:10, ..., 23:55–00:00.
+    - For each bin (time-of-day slot), we look at events from the LAST 24 HOURS.
+      If there were events in that bin, we show the most recent day for that bin
+      and the count of events on that day.
+    - If there were NO events in that bin in the last 24h:
+        * If the bin's time window has ALREADY occurred at least once
+          since the script started, we show 0 and the date of the FIRST time
+          that bin occurred since script start.
+        * If the bin's time window has NEVER occurred since the script
+          started, we show 0 and date "N/A".
+    """
     now = datetime.now()
+    window_start = now - timedelta(hours=24)
 
-    # Only show from service start time or last 24h
-    visible_start = max(start_time, now - timedelta(hours=24))
+    # Only consider events from the last 24 hours for "last recorded" values
+    recent_events = [t for t in motion_events if t >= window_start]
 
-    recent_events = [t for t in motion_events if t >= visible_start]
+    minutes_per_day = 24 * 60
+    num_bins = minutes_per_day // BIN_MINUTES
 
-    bin_length = timedelta(minutes=BIN_MINUTES)
-    current_bin_start = floor_to_bin(now)
-    start_bin = floor_to_bin(visible_start)
+    # Aggregate by (date, bin_index): count + latest event time for that day/bin
+    # key: (date, bin_index) -> {"count": int, "latest_dt": datetime}
+    bin_day_info = {}
+
+    for t in recent_events:
+        # Determine bin index from time-of-day
+        minute_of_day = t.hour * 60 + t.minute
+        bin_index = minute_of_day // BIN_MINUTES  # 0 .. num_bins-1
+
+        key = (t.date(), bin_index)
+        entry = bin_day_info.get(key)
+        if entry is None:
+            bin_day_info[key] = {"count": 1, "latest_dt": t}
+        else:
+            entry["count"] += 1
+            if t > entry["latest_dt"]:
+                entry["latest_dt"] = t
+
+    # For each bin index, pick the most recent (date, count) over the last 24h
+    # bin_display[bin_index] = {
+    #     "date": date,
+    #     "count": int,
+    #     "latest_dt": datetime
+    # }
+    bin_display = {}
+
+    for (day, idx), entry in bin_day_info.items():
+        current = bin_display.get(idx)
+        if current is None or entry["latest_dt"] > current["latest_dt"]:
+            bin_display[idx] = {
+                "date": day,
+                "count": entry["count"],
+                "latest_dt": entry["latest_dt"],
+            }
 
     html_parts = []
-    bin_start = start_bin
 
-    # We never exceed 24h worth of bins
-    max_bins = int(24 * 60 / BIN_MINUTES)
+    # Helper: determine if a bin's time window has ever occurred since script start,
+    # and if so, the first time that window started since script start.
+    def first_occurrence_since_start(start_hour: int, start_minute: int):
+        """
+        Returns:
+            first_start (datetime) if the bin's [start_hour:start_minute]
+            has occurred at least once since script start, else None.
+        """
+        # First candidate on the start day
+        first_candidate = start_time.replace(
+            hour=start_hour, minute=start_minute, second=0, microsecond=0
+        )
+        if first_candidate < start_time:
+            # We already passed this slot on the start day, so the first
+            # occurrence is on the next day
+            first_candidate += timedelta(days=1)
 
-    count_bins = 0
-    while bin_start <= current_bin_start and count_bins < max_bins:
-        bin_end = bin_start + bin_length
-        display_end = min(bin_end, now)
+        if first_candidate <= now:
+            return first_candidate
+        else:
+            return None
 
-        count = sum(1 for t in recent_events if bin_start <= t < bin_end)
+    for bin_index in range(num_bins):
+        # Compute time-of-day range for this bin index
+        start_minutes = bin_index * BIN_MINUTES
+        end_minutes = start_minutes + BIN_MINUTES
 
-        date_str = bin_start.strftime("%Y-%m-%d")
-        start_str = bin_start.strftime("%H:%M")
-        end_str = display_end.strftime("%H:%M")
+        start_hour = start_minutes // 60
+        start_minute = start_minutes % 60
 
-        line = f"{date_str} {start_str} - {end_str}: Detected {count:2d} motion events."
+        # End hour/minute, wrapping at 24:00 -> 00:00
+        end_hour = (end_minutes // 60) % 24
+        end_minute = end_minutes % 60
+
+        # 1) If we have recorded events for this bin in the last 24h:
+        info = bin_display.get(bin_index)
+        if info is not None:
+            date_for_bin = info["date"]
+            count = info["count"]
+            date_label = date_for_bin.strftime("%Y-%m-%d")
+        else:
+            # 2) No events in last 24h for this bin.
+            #    Check whether its time window has occurred since script start.
+            first_occ = first_occurrence_since_start(start_hour, start_minute)
+
+            if first_occ is not None:
+                # The bin window has occurred at least once since the script started,
+                # but there were no events for that bin in the last 24h.
+                count = 0
+                date_label = first_occ.date().strftime("%Y-%m-%d")
+            else:
+                # The bin window has NEVER occurred since the script started:
+                # show 0 and N/A so it's obvious this time-of-day hasn't been reached yet.
+                count = 0
+                date_label = "N/A"
+
+        start_str = f"{start_hour:02d}:{start_minute:02d}"
+        end_str = f"{end_hour:02d}:{end_minute:02d}"
+
+        line = (
+            f"{date_label} {start_str} - {end_str}: "
+            f"Detected {count:2d} motion events."
+        )
         html_parts.append(f"<div class='row'>{line}</div>")
 
-        # Separator rule at the end of each hour
-        if (bin_start.minute + BIN_MINUTES) % 60 == 0 and bin_start < current_bin_start:
+        # Separator at the end of each hour, except after the very last bin
+        if (start_minutes + BIN_MINUTES) % 60 == 0 and bin_index < num_bins - 1:
             html_parts.append("<hr class='hour-sep'>")
-
-        bin_start += bin_length
-        count_bins += 1
 
     return "".join(html_parts)
 
@@ -135,8 +223,12 @@ def index():
       <body>
         <h1>Motion Activity</h1>
         <div class="subtitle">
-          Activity in {BIN_MINUTES}-minute bins since service start (max last 24h).
-          Page refreshes every 30 seconds.
+          24-hour view in {BIN_MINUTES}-minute bins, aligned to time-of-day (00:00 → 23:59).<br>
+          Each bin shows the last recorded number of motion events for that bin
+          within the past 24 hours, plus the date of that last activity.<br>
+          If a bin's time window has never occurred since the script started,
+          its date is shown as "N/A".<br>
+          Auto-refreshes every 30 seconds.
         </div>
         <div class="box">
           {bins_html}
