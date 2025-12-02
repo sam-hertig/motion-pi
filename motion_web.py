@@ -1,6 +1,6 @@
 from gpiozero import MotionSensor
 from flask import Flask
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 import threading
 import time
@@ -16,6 +16,9 @@ LOG_RETENTION_DAYS = 90
 # Network monitoring
 NETWORK_CHECK_INTERVAL = 60  # seconds between checks
 EXTERNAL_IP = "1.1.1.1"      # external host for internet reachability
+
+# Bin logging
+BIN_FLUSH_INTERVAL = 2       # seconds between checks for finished bins
 # ============================================================
 
 pir = MotionSensor(PIR_PIN)
@@ -26,15 +29,22 @@ last_motion = None
 
 start_time = datetime.now()
 
-# Logging (motion/bin logging, as before)
+# Logging
 log_file_path = None
 last_log_prune = None
-current_day_bin_counts = {}  # key = bin_index, value = count
-last_logged_bin = None       # bin_index last written to log
 
 # Network monitoring globals
 ROUTER_IP = None
 network_state = None  # "NO_ROUTER_INFO", "LAN_DOWN", "LAN_UP_INTERNET_DOWN", "INTERNET_UP"
+
+# Bin logging state (shared between threads)
+bin_lock = threading.Lock()
+log_lock = threading.Lock()
+
+active_date = start_time.date()           # date whose bins we're currently counting
+current_day_bin_counts = {}               # bin_index -> count, for active_date
+start_bin_index = (start_time.hour * 60 + start_time.minute) // BIN_MINUTES
+last_logged_bin = start_bin_index - 1     # last bin written for active_date
 
 
 # ------------------------------------------------------------
@@ -57,7 +67,7 @@ def get_router_ip():
 
 
 # ------------------------------------------------------------
-# Logging helpers (bins) — motion logging unchanged in behavior
+# Log file helpers
 # ------------------------------------------------------------
 
 def init_log_file():
@@ -68,20 +78,20 @@ def init_log_file():
     ts = start_time.strftime("%Y%m%d_%H%M%S")
     log_file_path = script_dir / f"motion_log_{ts}.txt"
 
-    # Detect router IP once at startup and log it
     ROUTER_IP = get_router_ip()
 
-    with log_file_path.open("w", encoding="utf-8") as f:
-        f.write("Motion bin log\n")
-        f.write(f"Started: {start_time:%Y-%m-%d %H:%M:%S}\n")
-        f.write(f"Retention: last {LOG_RETENTION_DAYS} days\n")
-        if ROUTER_IP:
-            f.write(f"Router IP detected: {ROUTER_IP}\n")
-        else:
-            f.write("Router IP detected: UNKNOWN (could not detect default gateway)\n")
-        f.write(f"External IP used for internet check: {EXTERNAL_IP}\n")
-        f.write("Format: YYYY-MM-DD HH:MM - HH:MM: Detected NN motion events.\n")
-        f.write("-------------------------------------------------------------\n")
+    with log_lock:
+        with log_file_path.open("w", encoding="utf-8") as f:
+            f.write("Motion bin log\n")
+            f.write(f"Started: {start_time:%Y-%m-%d %H:%M:%S}\n")
+            f.write(f"Retention: last {LOG_RETENTION_DAYS} days\n")
+            if ROUTER_IP:
+                f.write(f"Router IP detected: {ROUTER_IP}\n")
+            else:
+                f.write("Router IP detected: UNKNOWN (could not detect default gateway)\n")
+            f.write(f"External IP used for internet check: {EXTERNAL_IP}\n")
+            f.write("Format: YYYY-MM-DD HH:MM - HH:MM: Detected NN motion events.\n")
+            f.write("-------------------------------------------------------------\n")
 
     last_log_prune = start_time
 
@@ -92,32 +102,33 @@ def prune_log_file(now):
     if log_file_path is None:
         return
 
-    # prune once per day (or if first time)
+    # prune once per day
     if last_log_prune and (now - last_log_prune) < timedelta(days=1):
         return
 
     cutoff = now - timedelta(days=LOG_RETENTION_DAYS)
     cutoff_date_str = cutoff.strftime("%Y-%m-%d")
 
-    lines_to_keep = []
-    with log_file_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line[:10].isdigit():
-                # header or non-timestamp lines
-                lines_to_keep.append(line)
-                continue
+    with log_lock:
+        lines_to_keep = []
+        with log_file_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                # Keep headers / non-date lines
+                if not line[:10].isdigit():
+                    lines_to_keep.append(line)
+                    continue
 
-            date_str = line[:10]
-            if date_str >= cutoff_date_str:
-                lines_to_keep.append(line)
+                date_str = line[:10]
+                if date_str >= cutoff_date_str:
+                    lines_to_keep.append(line)
 
-    with log_file_path.open("w", encoding="utf-8") as f:
-        f.writelines(lines_to_keep)
+        with log_file_path.open("w", encoding="utf-8") as f:
+            f.writelines(lines_to_keep)
 
     last_log_prune = now
 
 
-def write_bin_to_log(date, bin_index, count):
+def write_bin_to_log(day: date, bin_index: int, count: int):
     """Append one finished bin to the log file."""
     if log_file_path is None:
         return
@@ -130,62 +141,114 @@ def write_bin_to_log(date, bin_index, count):
     eh = (end_minutes // 60) % 24
     em = end_minutes % 60
 
-    date_str = date.strftime("%Y-%m-%d")
+    date_str = day.strftime("%Y-%m-%d")
     start_str = f"{sh:02d}:{sm:02d}"
     end_str = f"{eh:02d}:{em:02d}"
 
     line = f"{date_str} {start_str} - {end_str}: Detected {count:2d} motion events.\n"
-    with log_file_path.open("a", encoding="utf-8") as f:
-        f.write(line)
+    with log_lock:
+        with log_file_path.open("a", encoding="utf-8") as f:
+            f.write(line)
 
 
-def update_and_log_bins(now):
-    """
-    Called after every motion event.
-    Detects when a bin has finished and writes it to the log exactly once.
-    """
-    global last_logged_bin, current_day_bin_counts
-
-    # Determine current bin index
-    minute_of_day = now.hour * 60 + now.minute
-    current_bin = minute_of_day // BIN_MINUTES
-
-    # Very simple day rollover handling (same as before)
-    if now.date() != start_time.date():
-        # On first day change, reset per-day state
-        start_time.replace(day=now.day)  # note: this line is intentionally left as-is
-        last_logged_bin = None
-        current_day_bin_counts = {}
-
-    # Initialize last_logged_bin if needed
-    if last_logged_bin is None:
-        last_logged_bin = current_bin - 1
-
-    # Log bins that have fully passed since last time
-    while last_logged_bin < current_bin - 1:
-        bin_to_write = last_logged_bin + 1
-        # count may be zero if never hit
-        count = current_day_bin_counts.get(bin_to_write, 0)
-        write_bin_to_log(now.date(), bin_to_write, count)
-        last_logged_bin = bin_to_write
-
-    # prune occasionally
-    prune_log_file(now)
-
-
-# ------------------------------------------------------------
-# Network monitoring helpers (NEW)
-# ------------------------------------------------------------
-
-def log_network_event(message):
+def log_network_event(message: str):
     """Append a network-related line to the log file."""
     if log_file_path is None:
         return
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"{ts} NET: {message}\n"
-    with log_file_path.open("a", encoding="utf-8") as f:
-        f.write(line)
+    with log_lock:
+        with log_file_path.open("a", encoding="utf-8") as f:
+            f.write(line)
 
+
+# ------------------------------------------------------------
+# Bin logging core (independent of motion)
+# ------------------------------------------------------------
+
+def flush_finished_bins(now: datetime):
+    """
+    Write out any bins that have finished since last_logged_bin.
+    This is what ensures bins are logged even with 0 motion and during quiet periods.
+    """
+    global active_date, current_day_bin_counts, last_logged_bin
+
+    minutes_per_day = 24 * 60
+    num_bins = minutes_per_day // BIN_MINUTES
+    current_bin = (now.hour * 60 + now.minute) // BIN_MINUTES
+
+    # Handle day rollover: if we are now on a later date than active_date,
+    # flush the remaining bins of the old active_date completely.
+    if now.date() != active_date:
+        # 1) Flush remaining bins for old active_date (from last_logged_bin+1 to last bin)
+        for b in range(last_logged_bin + 1, num_bins):
+            count = current_day_bin_counts.get(b, 0)
+            write_bin_to_log(active_date, b, count)
+
+        # 2) Reset state for the new day
+        active_date = now.date()
+        current_day_bin_counts = {}
+        last_logged_bin = -1  # no finished bins written yet for the new day
+
+        # Also prune once per day around rollover
+        prune_log_file(now)
+
+    # For current day: bins < current_bin are finished (current_bin is in-progress)
+    target_last = current_bin - 1
+    if target_last > last_logged_bin:
+        for b in range(last_logged_bin + 1, target_last + 1):
+            count = current_day_bin_counts.get(b, 0)
+            write_bin_to_log(active_date, b, count)
+        last_logged_bin = target_last
+
+
+def bin_logger():
+    """Background thread that continuously flushes finished bins (even during no motion)."""
+    while True:
+        now = datetime.now()
+        with bin_lock:
+            flush_finished_bins(now)
+        time.sleep(BIN_FLUSH_INTERVAL)
+
+
+# ------------------------------------------------------------
+# Motion watcher (ONLY increments per-bin counts; bin_logger does the flushing)
+# ------------------------------------------------------------
+
+def motion_watcher():
+    global last_motion, motion_events, active_date, current_day_bin_counts
+
+    print("PIR watcher started...")
+    time.sleep(2)
+
+    while True:
+        pir.wait_for_motion()
+        now = datetime.now()
+        last_motion = now
+        motion_events.append(now)
+
+        # Keep memory short (only last 48 hours)
+        cutoff_mem = now - timedelta(hours=48)
+        motion_events[:] = [t for t in motion_events if t >= cutoff_mem]
+
+        # Increment count for THIS bin (for the correct day)
+        with bin_lock:
+            # Ensure bin state is on the correct date (in case midnight passed)
+            flush_finished_bins(now)
+
+            minute_of_day = now.hour * 60 + now.minute
+            bin_index = minute_of_day // BIN_MINUTES
+            current_day_bin_counts[bin_index] = current_day_bin_counts.get(bin_index, 0) + 1
+
+        print("Motion detected at", now.strftime("%Y-%m-%d %H:%M:%S"))
+
+        pir.wait_for_no_motion()
+        print("No motion")
+
+
+# ------------------------------------------------------------
+# Network monitoring
+# ------------------------------------------------------------
 
 def ping_host(host, timeout=1):
     """Return True if host responds to a single ping, else False."""
@@ -226,7 +289,6 @@ def network_watcher():
         if router_ok:
             external_ok = ping_host(EXTERNAL_IP)
 
-        # Determine state + log message
         if not ROUTER_IP:
             state = "NO_ROUTER_INFO"
             msg = "Router IP unknown; cannot perform network checks."
@@ -240,48 +302,12 @@ def network_watcher():
             state = "INTERNET_UP"
             msg = f"Router reachable ({ROUTER_IP}) and external host {EXTERNAL_IP} reachable. Network UP."
 
-        # Log only on state changes
         if state != prev_state:
             log_network_event(msg)
             prev_state = state
 
         network_state = state
-
         time.sleep(NETWORK_CHECK_INTERVAL)
-
-
-# ------------------------------------------------------------
-# Motion watcher (unchanged except calling update_and_log_bins)
-# ------------------------------------------------------------
-
-def motion_watcher():
-    global last_motion, motion_events, current_day_bin_counts
-
-    print("PIR watcher started...")
-    time.sleep(2)
-
-    while True:
-        pir.wait_for_motion()
-        now = datetime.now()
-        last_motion = now
-        motion_events.append(now)
-
-        # Keep memory short (only last 48 hours)
-        cutoff_mem = now - timedelta(hours=48)
-        motion_events[:] = [t for t in motion_events if t >= cutoff_mem]
-
-        # Increment count for THIS bin
-        minute_of_day = now.hour * 60 + now.minute
-        bin_index = minute_of_day // BIN_MINUTES
-        current_day_bin_counts[bin_index] = current_day_bin_counts.get(bin_index, 0) + 1
-
-        # Check whether any bins finished and log them
-        update_and_log_bins(now)
-
-        print("Motion detected at", now.strftime("%Y-%m-%d %H:%M:%S"))
-
-        pir.wait_for_no_motion()
-        print("No motion")
 
 
 # ------------------------------------------------------------
@@ -290,9 +316,13 @@ def motion_watcher():
 
 def build_bins_html():
     """
-    Returns HTML for the 24h rolling per-bin UI.
-    Logic unchanged: last 24h, last recorded per bin, N/A for bins
-    whose time-of-day hasn't occurred since script start.
+    24h view in BIN_MINUTES bins, aligned to time-of-day.
+
+    Per bin:
+    - If there were events in the last 24h for that bin: show the most recent day with activity and that count.
+    - If NO events in last 24h: still show the bin with count 0.
+        * If that bin time-of-day has occurred at least once since script start: show the most recent occurrence date.
+        * Otherwise: show N/A.
     """
     now = datetime.now()
     window_start = now - timedelta(hours=24)
@@ -302,7 +332,7 @@ def build_bins_html():
     minutes_per_day = 24 * 60
     num_bins = minutes_per_day // BIN_MINUTES
 
-    # Aggregate by day and bin
+    # Aggregate by (date, bin_index): count + latest event time
     bin_day_info = {}
     for t in recent_events:
         minute = t.hour * 60 + t.minute
@@ -316,24 +346,22 @@ def build_bins_html():
             if t > e["latest_dt"]:
                 e["latest_dt"] = t
 
-    # Most recent 24h per-bin
+    # For each bin index, pick the most recent day with activity in last 24h
     bin_display = {}
     for (day, idx), e in bin_day_info.items():
         cur = bin_display.get(idx)
         if cur is None or e["latest_dt"] > cur["latest_dt"]:
-            bin_display[idx] = {
-                "date": day,
-                "count": e["count"],
-                "latest_dt": e["latest_dt"]
-            }
+            bin_display[idx] = {"date": day, "count": e["count"], "latest_dt": e["latest_dt"]}
 
     html_parts = []
 
-    def first_occ_after_start(h, m):
-        first = start_time.replace(hour=h, minute=m, second=0, microsecond=0)
-        if first < start_time:
-            first += timedelta(days=1)
-        return first if first <= now else None
+    def latest_occurrence_since_start(h, m):
+        candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if candidate > now:
+            candidate -= timedelta(days=1)
+        if candidate < start_time:
+            return None
+        return candidate
 
     for i in range(num_bins):
         start_min = i * BIN_MINUTES
@@ -348,11 +376,8 @@ def build_bins_html():
             count = bin_display[i]["count"]
             date_label = d.strftime("%Y-%m-%d")
         else:
-            occ = first_occ_after_start(sh, sm)
-            if occ:
-                date_label = occ.date().strftime("%Y-%m-%d")
-            else:
-                date_label = "N/A"
+            occ = latest_occurrence_since_start(sh, sm)
+            date_label = occ.date().strftime("%Y-%m-%d") if occ else "N/A"
             count = 0
 
         html_parts.append(
@@ -410,6 +435,9 @@ if __name__ == "__main__":
 
     t = threading.Thread(target=motion_watcher, daemon=True)
     t.start()
+
+    bin_t = threading.Thread(target=bin_logger, daemon=True)
+    bin_t.start()
 
     net_t = threading.Thread(target=network_watcher, daemon=True)
     net_t.start()
