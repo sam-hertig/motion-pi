@@ -19,6 +19,10 @@ EXTERNAL_IP = "1.1.1.1"      # external host for internet reachability
 
 # Bin logging
 BIN_FLUSH_INTERVAL = 2       # seconds between checks for finished bins
+
+# Pruning
+PRUNE_CHECK_INTERVAL = 60    # check once per minute whether it's time to prune
+PRUNE_AT_HOUR = 2            # run daily prune at ~02:00 local time
 # ============================================================
 
 pir = MotionSensor(PIR_PIN)
@@ -31,7 +35,7 @@ start_time = datetime.now()
 
 # Logging
 log_file_path = None
-last_log_prune = None
+last_log_prune_at = None
 
 # Network monitoring globals
 ROUTER_IP = None
@@ -72,7 +76,7 @@ def get_router_ip():
 
 def init_log_file():
     """Create a new log file in the same folder as the script."""
-    global log_file_path, last_log_prune, ROUTER_IP
+    global log_file_path, last_log_prune_at, ROUTER_IP
 
     script_dir = Path(__file__).resolve().parent
     ts = start_time.strftime("%Y%m%d_%H%M%S")
@@ -93,39 +97,7 @@ def init_log_file():
             f.write("Format: YYYY-MM-DD HH:MM - HH:MM: Detected NN motion events.\n")
             f.write("-------------------------------------------------------------\n")
 
-    last_log_prune = start_time
-
-
-def prune_log_file(now):
-    """Remove log lines older than LOG_RETENTION_DAYS (by date prefix)."""
-    global last_log_prune
-    if log_file_path is None:
-        return
-
-    # prune once per day
-    if last_log_prune and (now - last_log_prune) < timedelta(days=1):
-        return
-
-    cutoff = now - timedelta(days=LOG_RETENTION_DAYS)
-    cutoff_date_str = cutoff.strftime("%Y-%m-%d")
-
-    with log_lock:
-        lines_to_keep = []
-        with log_file_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                # Keep headers / non-date lines
-                if not line[:10].isdigit():
-                    lines_to_keep.append(line)
-                    continue
-
-                date_str = line[:10]
-                if date_str >= cutoff_date_str:
-                    lines_to_keep.append(line)
-
-        with log_file_path.open("w", encoding="utf-8") as f:
-            f.writelines(lines_to_keep)
-
-    last_log_prune = now
+    last_log_prune_at = None
 
 
 def write_bin_to_log(day: date, bin_index: int, count: int):
@@ -162,6 +134,126 @@ def log_network_event(message: str):
             f.write(line)
 
 
+def log_prune_event(removed: int, kept: int, cutoff_dt: datetime):
+    """Append a prune summary line after a prune run."""
+    if log_file_path is None:
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = (
+        f"{ts} PRUNE: Removed {removed} lines older than {LOG_RETENTION_DAYS} days "
+        f"(cutoff {cutoff_dt:%Y-%m-%d %H:%M:%S}). Kept {kept} lines.\n"
+    )
+    with log_lock:
+        with log_file_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+
+
+# ------------------------------------------------------------
+# Robust pruning (true “older than N days”)
+# ------------------------------------------------------------
+
+def _parse_line_timestamp(line: str):
+    """
+    Returns a datetime for timestamped lines, or None.
+
+    Supported:
+    - NET/PRUNE/etc: "YYYY-MM-DD HH:MM:SS ..."
+    - Bin lines:     "YYYY-MM-DD HH:MM - HH:MM: ..."
+      (uses bin START time as the line timestamp)
+    """
+    if len(line) < 16 or not line[:10].isdigit():
+        return None
+
+    # Case 1: full timestamp with seconds
+    # "YYYY-MM-DD HH:MM:SS"
+    if len(line) >= 19 and line[4] == "-" and line[7] == "-" and line[10] == " " and line[13] == ":" and line[16] == ":":
+        try:
+            return datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+
+    # Case 2: bin line timestamp (start time)
+    # "YYYY-MM-DD HH:MM -"
+    if len(line) >= 18 and line[4] == "-" and line[7] == "-" and line[10] == " " and line[13] == ":" and line[16:18] == " -":
+        try:
+            return datetime.strptime(line[:16], "%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+
+    return None
+
+
+def prune_log_file(force: bool = False):
+    """
+    Remove log lines older than LOG_RETENTION_DAYS (true age).
+
+    - Keeps header lines (non-timestamped lines).
+    - Removes timestamped lines with timestamp < cutoff_dt.
+    - Logs a PRUNE summary line after successful pruning.
+    """
+    global last_log_prune_at
+    if log_file_path is None:
+        return
+
+    now = datetime.now()
+    if not force and last_log_prune_at is not None:
+        # Don’t prune too frequently unless forced
+        if (now - last_log_prune_at) < timedelta(hours=12):
+            return
+
+    cutoff_dt = now - timedelta(days=LOG_RETENTION_DAYS)
+
+    with log_lock:
+        try:
+            with log_file_path.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return
+
+        kept_lines = []
+        removed = 0
+        kept_timestamped = 0
+
+        for line in lines:
+            ts = _parse_line_timestamp(line)
+            if ts is None:
+                # header / unknown -> keep
+                kept_lines.append(line)
+                continue
+
+            if ts >= cutoff_dt:
+                kept_lines.append(line)
+                kept_timestamped += 1
+            else:
+                removed += 1
+
+        with log_file_path.open("w", encoding="utf-8") as f:
+            f.writelines(kept_lines)
+
+    last_log_prune_at = now
+    # PRUNE summary is appended (so it will always exist even after rewrite)
+    log_prune_event(removed=removed, kept=kept_timestamped, cutoff_dt=cutoff_dt)
+
+
+def prune_watcher():
+    """
+    Background thread that runs pruning daily (and once shortly after startup).
+    """
+    # Run a prune soon after startup so retention is enforced even if we rebooted late
+    time.sleep(5)
+    prune_log_file(force=True)
+
+    while True:
+        now = datetime.now()
+        # Run at PRUNE_AT_HOUR each day (best-effort)
+        if now.hour == PRUNE_AT_HOUR:
+            prune_log_file(force=True)
+            # avoid re-running multiple times during the same hour
+            time.sleep(3600)
+            continue
+        time.sleep(PRUNE_CHECK_INTERVAL)
+
+
 # ------------------------------------------------------------
 # Bin logging core (independent of motion)
 # ------------------------------------------------------------
@@ -169,7 +261,7 @@ def log_network_event(message: str):
 def flush_finished_bins(now: datetime):
     """
     Write out any bins that have finished since last_logged_bin.
-    This is what ensures bins are logged even with 0 motion and during quiet periods.
+    Ensures bins are logged even with 0 motion and during quiet periods.
     """
     global active_date, current_day_bin_counts, last_logged_bin
 
@@ -177,21 +269,15 @@ def flush_finished_bins(now: datetime):
     num_bins = minutes_per_day // BIN_MINUTES
     current_bin = (now.hour * 60 + now.minute) // BIN_MINUTES
 
-    # Handle day rollover: if we are now on a later date than active_date,
-    # flush the remaining bins of the old active_date completely.
+    # Day rollover: flush remaining bins of the previous day.
     if now.date() != active_date:
-        # 1) Flush remaining bins for old active_date (from last_logged_bin+1 to last bin)
         for b in range(last_logged_bin + 1, num_bins):
             count = current_day_bin_counts.get(b, 0)
             write_bin_to_log(active_date, b, count)
 
-        # 2) Reset state for the new day
         active_date = now.date()
         current_day_bin_counts = {}
-        last_logged_bin = -1  # no finished bins written yet for the new day
-
-        # Also prune once per day around rollover
-        prune_log_file(now)
+        last_logged_bin = -1
 
     # For current day: bins < current_bin are finished (current_bin is in-progress)
     target_last = current_bin - 1
@@ -233,15 +319,12 @@ def motion_watcher():
 
         # Increment count for THIS bin (for the correct day)
         with bin_lock:
-            # Ensure bin state is on the correct date (in case midnight passed)
             flush_finished_bins(now)
-
             minute_of_day = now.hour * 60 + now.minute
             bin_index = minute_of_day // BIN_MINUTES
             current_day_bin_counts[bin_index] = current_day_bin_counts.get(bin_index, 0) + 1
 
         print("Motion detected at", now.strftime("%Y-%m-%d %H:%M:%S"))
-
         pir.wait_for_no_motion()
         print("No motion")
 
@@ -264,16 +347,12 @@ def ping_host(host, timeout=1):
 
 
 def network_watcher():
-    """
-    Background thread that monitors LAN + internet reachability
-    and logs only on state changes.
-    """
+    """Background thread that monitors LAN + internet reachability and logs only on state changes."""
     global ROUTER_IP, network_state
 
     prev_state = None
 
     while True:
-        # If router IP is still unknown, try to detect it again
         if ROUTER_IP is None:
             router_ip = get_router_ip()
             if router_ip is not None:
@@ -311,19 +390,10 @@ def network_watcher():
 
 
 # ------------------------------------------------------------
-# UI helpers (24h rolling view) — unchanged
+# UI helpers (24h rolling view)
 # ------------------------------------------------------------
 
 def build_bins_html():
-    """
-    24h view in BIN_MINUTES bins, aligned to time-of-day.
-
-    Per bin:
-    - If there were events in the last 24h for that bin: show the most recent day with activity and that count.
-    - If NO events in last 24h: still show the bin with count 0.
-        * If that bin time-of-day has occurred at least once since script start: show the most recent occurrence date.
-        * Otherwise: show N/A.
-    """
     now = datetime.now()
     window_start = now - timedelta(hours=24)
 
@@ -395,7 +465,6 @@ def build_bins_html():
 @app.route("/")
 def index():
     bins_html = build_bins_html()
-
     return f"""
     <html>
       <head>
@@ -441,5 +510,8 @@ if __name__ == "__main__":
 
     net_t = threading.Thread(target=network_watcher, daemon=True)
     net_t.start()
+
+    prune_t = threading.Thread(target=prune_watcher, daemon=True)
+    prune_t.start()
 
     app.run(host="0.0.0.0", port=8080)
