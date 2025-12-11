@@ -161,25 +161,44 @@ def _parse_line_timestamp(line: str):
     - Bin lines:     "YYYY-MM-DD HH:MM - HH:MM: ..."
       (uses bin START time as the line timestamp)
     """
-    if len(line) < 16 or not line[:10].isdigit():
+    # Strip newline but keep the rest
+    line = line.rstrip("\n")
+
+    # We need at least "YYYY-MM-DD HH:MM" to consider it
+    if len(line) < 16:
         return None
 
     # Case 1: full timestamp with seconds
-    # "YYYY-MM-DD HH:MM:SS"
-    if len(line) >= 19 and line[4] == "-" and line[7] == "-" and line[10] == " " and line[13] == ":" and line[16] == ":":
+    # "YYYY-MM-DD HH:MM:SS ..."
+    if (
+        len(line) >= 19
+        and line[4] == "-"
+        and line[7] == "-"
+        and line[10] == " "
+        and line[13] == ":"
+        and line[16] == ":"
+    ):
         try:
             return datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            pass
+            pass  # fall through to other patterns
 
     # Case 2: bin line timestamp (start time)
-    # "YYYY-MM-DD HH:MM -"
-    if len(line) >= 18 and line[4] == "-" and line[7] == "-" and line[10] == " " and line[13] == ":" and line[16:18] == " -":
+    # "YYYY-MM-DD HH:MM - HH:MM: ..."
+    if (
+        len(line) >= 18
+        and line[4] == "-"
+        and line[7] == "-"
+        and line[10] == " "
+        and line[13] == ":"
+        and line[16:18] == " -"
+    ):
         try:
             return datetime.strptime(line[:16], "%Y-%m-%d %H:%M")
         except ValueError:
             pass
 
+    # Anything else is treated as header / non-timestamped
     return None
 
 
